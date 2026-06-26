@@ -70,6 +70,90 @@ pub struct CursorPositionUiPayload {
     pub text: String,
 }
 
+/// Public snapshot of the plot camera and viewport in world/data coordinates.
+///
+/// This intentionally exposes a stable value type instead of the internal
+/// camera implementation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlotViewBounds {
+    /// Minimum visible x value in world/data coordinates.
+    pub x_min: f64,
+    /// Maximum visible x value in world/data coordinates.
+    pub x_max: f64,
+    /// Minimum visible y value in world/data coordinates.
+    pub y_min: f64,
+    /// Maximum visible y value in world/data coordinates.
+    pub y_max: f64,
+    /// Camera center x value in world/data coordinates.
+    pub center_x: f64,
+    /// Camera center y value in world/data coordinates.
+    pub center_y: f64,
+    /// Camera half width in world/data coordinates.
+    pub half_width: f64,
+    /// Camera half height in world/data coordinates.
+    pub half_height: f64,
+    /// Plot viewport width in screen pixels.
+    pub viewport_width: f64,
+    /// Plot viewport height in screen pixels.
+    pub viewport_height: f64,
+}
+
+/// Public snapshot of a plot camera/viewport update.
+///
+/// The `bounds` field is the same view snapshot returned by
+/// [`PlotUiMessage::get_view_bounds`]. The boolean fields classify the view
+/// update without requiring applications to diff consecutive bounds snapshots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlotViewChange {
+    pub bounds: PlotViewBounds,
+    pub x_zoomed: bool,
+    pub y_zoomed: bool,
+    pub panned: bool,
+    pub resized: bool,
+}
+
+impl PlotViewBounds {
+    pub(crate) fn from_camera_bounds(camera: &Camera, bounds: &Rectangle) -> Self {
+        Self {
+            x_min: camera.position.x - camera.half_extents.x,
+            x_max: camera.position.x + camera.half_extents.x,
+            y_min: camera.position.y - camera.half_extents.y,
+            y_max: camera.position.y + camera.half_extents.y,
+            center_x: camera.position.x,
+            center_y: camera.position.y,
+            half_width: camera.half_extents.x,
+            half_height: camera.half_extents.y,
+            viewport_width: f64::from(bounds.width),
+            viewport_height: f64::from(bounds.height),
+        }
+    }
+
+    /// Return the visible x range as `(min, max)`.
+    pub fn x_range(self) -> (f64, f64) {
+        (self.x_min, self.x_max)
+    }
+
+    /// Return the visible y range as `(min, max)`.
+    pub fn y_range(self) -> (f64, f64) {
+        (self.y_min, self.y_max)
+    }
+
+    /// Return the camera center as `[x, y]`.
+    pub fn center(self) -> [f64; 2] {
+        [self.center_x, self.center_y]
+    }
+
+    /// Return the camera half extents as `[x, y]`.
+    pub fn half_extents(self) -> [f64; 2] {
+        [self.half_width, self.half_height]
+    }
+
+    /// Return the viewport size as `[width, height]`.
+    pub fn viewport_size(self) -> [f64; 2] {
+        [self.viewport_width, self.viewport_height]
+    }
+}
+
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct PlotRenderUpdate {
@@ -81,6 +165,21 @@ pub struct PlotRenderUpdate {
     pub y_ticks: Option<Vec<PositionedTick>>,
     /// Internal: Camera and bounds for coordinate conversion (only used internally, not part of public API)
     pub(crate) camera_bounds: Option<Box<(Camera, Rectangle)>>,
+    pub(crate) view_change: Option<PlotViewChange>,
+}
+
+impl PlotRenderUpdate {
+    /// Get the public view bounds snapshot for this render update.
+    pub fn view_bounds(&self) -> Option<PlotViewBounds> {
+        self.camera_bounds
+            .as_deref()
+            .map(|(camera, bounds)| PlotViewBounds::from_camera_bounds(camera, bounds))
+    }
+
+    /// Get the public view change snapshot for this render update.
+    pub fn view_change(&self) -> Option<PlotViewChange> {
+        self.view_change
+    }
 }
 
 /// Drag interaction event in data/world coordinates.
