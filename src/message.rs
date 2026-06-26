@@ -37,6 +37,30 @@ impl PlotUiMessage {
             None
         }
     }
+
+    /// Get the current public plot view bounds from the render update.
+    ///
+    /// Returns `None` for non-render messages, or for render messages that do
+    /// not carry a camera/viewport update.
+    pub fn get_view_bounds(&self) -> Option<PlotViewBounds> {
+        if let PlotUiMessage::RenderUpdate(update) = self {
+            update.view_bounds()
+        } else {
+            None
+        }
+    }
+
+    /// Get the current public plot view change from the render update.
+    ///
+    /// Returns `None` for non-render messages, or for render messages that do
+    /// not carry a camera/viewport change.
+    pub fn get_view_change(&self) -> Option<PlotViewChange> {
+        if let PlotUiMessage::RenderUpdate(update) = self {
+            update.view_change()
+        } else {
+            None
+        }
+    }
 }
 
 /// Context passed to hover/pick highlight callbacks.
@@ -179,6 +203,75 @@ impl PlotRenderUpdate {
     /// Get the public view change snapshot for this render update.
     pub fn view_change(&self) -> Option<PlotViewChange> {
         self.view_change
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::DVec2;
+
+    fn render_update_with_view_change(view_change: Option<PlotViewChange>) -> PlotRenderUpdate {
+        let camera = Camera {
+            position: DVec2::new(10.0, 20.0),
+            half_extents: DVec2::new(3.0, 4.0),
+            render_offset: DVec2::ZERO,
+        };
+        let bounds = Rectangle {
+            x: 1.0,
+            y: 2.0,
+            width: 640.0,
+            height: 480.0,
+        };
+
+        PlotRenderUpdate {
+            hover_pick: None,
+            drag_event: None,
+            clear_cursor_position: false,
+            cursor_position_ui: None,
+            x_ticks: None,
+            y_ticks: None,
+            camera_bounds: Some(Box::new((camera, bounds))),
+            view_change,
+        }
+    }
+
+    #[test]
+    fn plot_ui_message_exposes_view_bounds() {
+        let message = PlotUiMessage::RenderUpdate(render_update_with_view_change(None));
+        let bounds = message.get_view_bounds().unwrap();
+
+        assert_eq!(bounds.x_range(), (7.0, 13.0));
+        assert_eq!(bounds.y_range(), (16.0, 24.0));
+        assert_eq!(bounds.center(), [10.0, 20.0]);
+        assert_eq!(bounds.half_extents(), [3.0, 4.0]);
+        assert_eq!(bounds.viewport_size(), [640.0, 480.0]);
+    }
+
+    #[test]
+    fn non_render_messages_have_no_view_bounds() {
+        assert_eq!(PlotUiMessage::ToggleLegend.get_view_bounds(), None);
+    }
+
+    #[test]
+    fn plot_ui_message_exposes_view_change() {
+        let bounds = render_update_with_view_change(None).view_bounds().unwrap();
+        let view_change = PlotViewChange {
+            bounds,
+            x_zoomed: true,
+            y_zoomed: false,
+            panned: true,
+            resized: false,
+        };
+        let message =
+            PlotUiMessage::RenderUpdate(render_update_with_view_change(Some(view_change)));
+
+        assert_eq!(message.get_view_change(), Some(view_change));
+    }
+
+    #[test]
+    fn non_render_messages_have_no_view_change() {
+        assert_eq!(PlotUiMessage::ToggleLegend.get_view_change(), None);
     }
 }
 

@@ -32,7 +32,9 @@ use crate::{
     controls::PlotControls,
     default_style,
     legend::{self, LegendEntry},
-    message::{CursorPositionUiPayload, PlotRenderUpdate, TooltipUiPayload},
+    message::{
+        CursorPositionUiPayload, PlotRenderUpdate, PlotViewBounds, PlotViewChange, TooltipUiPayload,
+    },
     picking, plot_overlay,
     plot_renderer::{PlotRenderStrategy, PlotRenderer, RenderParams},
     plot_state::PlotState,
@@ -43,6 +45,7 @@ use crate::{
 };
 
 const PLOT_CONTENT_PADDING: f32 = 2.0;
+const VIEW_CHANGE_EPSILON: f64 = 1e-9;
 pub(crate) type CursorProvider = Arc<dyn Fn(f64, f64) -> String + Send + Sync>;
 
 /// Provider for highlighting a point.
@@ -1262,6 +1265,32 @@ fn widget_needs_camera_bounds(widget: &PlotWidget) -> bool {
     widget_has_any_tooltips(widget) || widget.shape_overlays_enabled.load(Ordering::Relaxed)
 }
 
+fn value_changed(a: f64, b: f64) -> bool {
+    (a - b).abs() > VIEW_CHANGE_EPSILON
+}
+
+fn build_view_change(
+    prev_camera: Camera,
+    prev_bounds: Rectangle,
+    camera: Camera,
+    bounds: Rectangle,
+) -> Option<PlotViewChange> {
+    let x_zoomed = value_changed(camera.half_extents.x, prev_camera.half_extents.x);
+    let y_zoomed = value_changed(camera.half_extents.y, prev_camera.half_extents.y);
+    let panned = value_changed(camera.position.x, prev_camera.position.x)
+        || value_changed(camera.position.y, prev_camera.position.y);
+    let resized = (bounds.width - prev_bounds.width).abs() > f32::EPSILON
+        || (bounds.height - prev_bounds.height).abs() > f32::EPSILON;
+
+    (x_zoomed || y_zoomed || panned || resized).then(|| PlotViewChange {
+        bounds: PlotViewBounds::from_camera_bounds(&camera, &bounds),
+        x_zoomed,
+        y_zoomed,
+        panned,
+        resized,
+    })
+}
+
 fn clear_hover_effect(widget: &PlotWidget, state: &mut PlotState, effects: &mut UpdateEffects) {
     let should_clear_hover =
         state.picking.last_hover_cache.is_some() || !widget.hovered_points.is_empty();
@@ -1615,6 +1644,11 @@ fn update_plot_program<const IS_CANVAS: bool>(
         invalidation.all();
     }
 
+    let view_change = build_view_change(prev_camera, prev_bounds, state.camera, state.bounds);
+    if view_change.is_some() {
+        effects.publish_camera_bounds = true;
+    }
+
     let had_hover_pick = effects.hover_pick.is_some();
     // Process picking results after event handling (works for both mouse events and data updates).
     consume_gpu_pick_results(widget, state, &mut effects);
@@ -1665,6 +1699,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
                 x_ticks: publish_x_ticks,
                 y_ticks: publish_y_ticks,
                 camera_bounds: camera_bounds.map(Box::new),
+                view_change,
             },
         )))
     } else {
@@ -1966,5 +2001,89 @@ pub(crate) fn world_to_screen_position_y(
         None
     } else {
         Some(screen_y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera(position: [f64; 2], half_extents: [f64; 2]) -> Camera {
+        Camera {
+            position: DVec2::new(position[0], position[1]),
+            half_extents: DVec2::new(half_extents[0], half_extents[1]),
+            render_offset: DVec2::ZERO,
+        }
+    }
+
+    fn bounds(width: f32, height: f32) -> Rectangle {
+        Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn build_view_change_reports_pan() {
+        let change = build_view_change(
+            camera([0.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+            camera([1.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+        )
+        .unwrap();
+
+        assert!(change.panned);
+        assert!(!change.x_zoomed);
+        assert!(!change.y_zoomed);
+        assert!(!change.resized);
+    }
+
+    #[test]
+    fn build_view_change_reports_zoom() {
+        let change = build_view_change(
+            camera([0.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+            camera([0.0, 0.0], [8.0, 5.0]),
+            bounds(640.0, 480.0),
+        )
+        .unwrap();
+
+        assert!(!change.panned);
+        assert!(change.x_zoomed);
+        assert!(!change.y_zoomed);
+        assert!(!change.resized);
+        assert_eq!(change.bounds.x_range(), (-8.0, 8.0));
+    }
+
+    #[test]
+    fn build_view_change_reports_resize() {
+        let change = build_view_change(
+            camera([0.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+            camera([0.0, 0.0], [10.0, 5.0]),
+            bounds(800.0, 480.0),
+        )
+        .unwrap();
+
+        assert!(!change.panned);
+        assert!(!change.x_zoomed);
+        assert!(!change.y_zoomed);
+        assert!(change.resized);
+        assert_eq!(change.bounds.viewport_size(), [800.0, 480.0]);
+    }
+
+    #[test]
+    fn build_view_change_ignores_unchanged_view() {
+        let change = build_view_change(
+            camera([0.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+            camera([0.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+        );
+
+        assert_eq!(change, None);
     }
 }
