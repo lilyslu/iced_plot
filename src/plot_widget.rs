@@ -315,6 +315,49 @@ impl PlotWidget {
         self.y_axis_link = Some(link);
     }
 
+    pub fn viewport_width(&self) -> f32 {
+        if let Some(bounds) = self.camera_bounds {
+            bounds.1.width
+        } else {
+            0.0
+        }
+    }
+
+    pub fn viewport_height(&self ) -> f32 {
+        if let Some(bounds) = self.camera_bounds {
+            bounds.1.height
+        } else {
+            0.0
+        }
+    }
+
+    /// Return the visible x range as `(min, max)`.
+    pub fn x_range(self) -> [f64; 2] {
+        if let Some(bounds) = self.camera_bounds {
+            bounds.0.x_range()
+        } else {
+            [0.0, 0.0]
+        }
+    }
+
+    /// Return the visible y range as `(min, max)`.
+    pub fn y_range(self) -> [f64; 2] {
+        if let Some(bounds) = self.camera_bounds {
+            bounds.0.y_range()
+        } else {
+            [0.0, 0.0]
+        }
+    }
+
+    /// Return the camera center as `[x, y]`.
+    pub fn center(self) -> [f64; 2] {
+        if let Some(bounds) = self.camera_bounds {
+            bounds.0.position.into()
+        } else {
+            [0.0, 0.0]
+        }
+    }
+
     /// Update and return the current plot style for a given application theme.
     pub(crate) fn update_style(&self, theme: &Theme) -> PlotStyle {
         let style = (self.style)(theme);
