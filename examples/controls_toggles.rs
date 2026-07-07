@@ -23,6 +23,7 @@ enum Message {
     ToggleBoxZoom(bool),
     ToggleCtrlScrollZoom(bool),
     ToggleDoubleClickAutoscale(bool),
+    ToggleDoubleClickAutoscaleY(bool),
     ToggleClickToPick(bool),
     ToggleClearPickOnEscape(bool),
     ToggleHighlightOnHover(bool),
@@ -109,6 +110,16 @@ impl App {
             }
             Message::ToggleDoubleClickAutoscale(enabled) => {
                 self.controls.zoom.double_click_autoscale = enabled;
+                if enabled {
+                    self.controls.zoom.double_click_autoscale_y = false;
+                }
+                self.apply_controls();
+            }
+            Message::ToggleDoubleClickAutoscaleY(enabled) => {
+                self.controls.zoom.double_click_autoscale_y = enabled;
+                if enabled {
+                    self.controls.zoom.double_click_autoscale = false;
+                }
                 self.apply_controls();
             }
             Message::ToggleClickToPick(enabled) => {
@@ -153,6 +164,9 @@ impl App {
                     checkbox(self.controls.zoom.double_click_autoscale)
                         .label("Zoom: double-click autoscale")
                         .on_toggle(Message::ToggleDoubleClickAutoscale),
+                    checkbox(self.controls.zoom.double_click_autoscale_y)
+                        .label("Zoom: double-click autoscale y")
+                        .on_toggle(Message::ToggleDoubleClickAutoscaleY),
                 ]
                 .spacing(16),
                 row![

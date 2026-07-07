@@ -40,6 +40,11 @@ pub struct ZoomControls {
 
     /// Enables double-click reset/autoscale behavior.
     pub double_click_autoscale: bool,
+
+    /// Enables double-click y-only autoscale behavior.
+    ///
+    /// If `double_click_autoscale` is also enabled, full autoscale takes precedence.
+    pub double_click_autoscale_y: bool,
 }
 
 /// Configures pick interactions.
@@ -72,6 +77,7 @@ impl Default for ZoomControls {
             box_zoom: true,
             scroll_with_ctrl: true,
             double_click_autoscale: true,
+            double_click_autoscale_y: false,
         }
     }
 }
