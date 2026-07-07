@@ -32,6 +32,7 @@ pub(crate) mod grid;
 pub(crate) mod legend;
 pub(crate) mod message;
 pub(crate) mod picking;
+pub(crate) mod plot_image;
 pub(crate) mod plot_overlay;
 pub(crate) mod plot_renderer;
 pub(crate) mod plot_state;
@@ -57,6 +58,7 @@ pub use message::{
     DragEvent, HoverPickEvent, PlotUiMessage, PlotViewBounds, PlotViewChange, PointId,
     TooltipContext,
 };
+pub use plot_image::PlotImage;
 pub use plot_overlay::PlotOverlay;
 pub use plot_renderer::PlotRenderStrategy;
 pub use plot_widget::{HighlightPoint, PlotWidget};

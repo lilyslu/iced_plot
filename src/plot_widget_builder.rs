@@ -7,6 +7,7 @@ use crate::axis_scale::AxisScale;
 use crate::controls::PlotControls;
 use crate::fill::Fill;
 use crate::message::TooltipContext;
+use crate::plot_image::PlotImage;
 use crate::plot_renderer::PlotRenderStrategy;
 use crate::plot_widget::{CursorProvider, HighlightPoint, HighlightPointProvider, PlotWidget};
 use crate::reference_lines::{HLine, VLine};
@@ -33,6 +34,7 @@ pub struct PlotWidgetBuilder {
     x_label: Option<String>,
     y_label: Option<String>,
     autoscale_on_updates: Option<bool>,
+    autoscale_y_on_updates: Option<bool>,
     hover_radius_px: Option<f32>,
     pick_highlight_provider: Option<HighlightPointProvider>,
     hover_highlight_provider: Option<HighlightPointProvider>,
@@ -59,6 +61,7 @@ pub struct PlotWidgetBuilder {
     data_aspect: Option<f64>,
     style: Option<StyleFn>,
     series: Vec<Series>,
+    images: Vec<PlotImage>,
     fills: Vec<Fill>,
     vlines: Vec<VLine>,
     hlines: Vec<HLine>,
@@ -91,6 +94,12 @@ impl PlotWidgetBuilder {
     /// Enable or disable autoscaling of the plot when new data is added.
     pub fn with_autoscale_on_updates(mut self, enabled: bool) -> Self {
         self.autoscale_on_updates = Some(enabled);
+        self
+    }
+
+    /// Enable or disable y-only autoscaling on relevant content updates.
+    pub fn with_autoscale_y_on_updates(mut self, enabled: bool) -> Self {
+        self.autoscale_y_on_updates = Some(enabled);
         self
     }
 
@@ -315,6 +324,12 @@ impl PlotWidgetBuilder {
         self
     }
 
+    /// Add a [`PlotImage`] to the plot.
+    pub fn add_image(mut self, image: PlotImage) -> Self {
+        self.images.push(image);
+        self
+    }
+
     /// Add a vertical reference line to the plot.
     pub fn add_vline(mut self, vline: VLine) -> Self {
         self.vlines.push(vline);
@@ -398,6 +413,9 @@ impl PlotWidgetBuilder {
         if let Some(enabled) = self.autoscale_on_updates {
             w.autoscale_on_updates(enabled);
         }
+        if let Some(enabled) = self.autoscale_y_on_updates {
+            w.autoscale_y_on_updates(enabled);
+        }
         if let Some(r) = self.hover_radius_px {
             w.hover_radius_px(r);
         }
@@ -471,6 +489,9 @@ impl PlotWidgetBuilder {
         }
         for s in self.series {
             w.add_series(s)?;
+        }
+        for image in self.images {
+            w.add_image(image)?;
         }
         for vline in self.vlines {
             w.add_vline(vline);

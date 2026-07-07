@@ -6,13 +6,14 @@ use crate::{
     LineType, Size,
     camera::Camera,
     grid::TickWeight,
-    plot_state::PlotState,
+    plot_state::{ImageSpan, PlotState},
     plot_widget::{world_to_screen_position_x, world_to_screen_position_y},
     point::{MARKER_SIZE_WORLD, MarkerType},
     transform::{data_point_to_plot_with_transform, data_value_to_plot_with_axis_range},
 };
 use iced::{
     Color, Rectangle,
+    advanced::image::{FilterMethod, Handle as ImageHandle, Image as CanvasImage},
     widget::canvas::{self, Frame, Geometry},
 };
 
@@ -57,6 +58,7 @@ pub(crate) fn draw(
         .static_layer
         .draw_with_bounds(renderer, frame_bounds, |frame| {
             draw_grid(frame, state, bounds);
+            draw_images(frame, state, bounds);
             draw_fills(frame, state, bounds);
             draw_lines(frame, state, bounds);
             draw_reference_lines(frame, state, bounds);
@@ -256,6 +258,134 @@ fn draw_markers(frame: &mut Frame, state: &PlotState, bounds: Rectangle) {
             );
         }
     }
+}
+
+fn draw_images(frame: &mut Frame, state: &PlotState, bounds: Rectangle) {
+    for image in state.images.iter() {
+        let Some(rect) = canvas_rect_for_image(image, &state.camera, &bounds) else {
+            continue;
+        };
+        let (width, height, pixels) = canvas_pixels_for_image(image);
+        if width == 0 || height == 0 || pixels.is_empty() {
+            continue;
+        }
+
+        let handle = ImageHandle::from_rgba(width, height, pixels);
+        frame.draw_image(
+            rect,
+            CanvasImage::new(handle).filter_method(FilterMethod::Linear),
+        );
+    }
+}
+
+fn canvas_rect_for_image(
+    image: &ImageSpan,
+    camera: &Camera,
+    bounds: &Rectangle,
+) -> Option<Rectangle> {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for vertex in image.vertices {
+        let point = world_to_canvas_point(vertex, camera, bounds);
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
+
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    (width > 0.0 && height > 0.0).then_some(Rectangle {
+        x: min_x,
+        y: min_y,
+        width,
+        height,
+    })
+}
+
+fn canvas_pixels_for_image(image: &ImageSpan) -> (u32, u32, Vec<u8>) {
+    let (left, right, top, bottom) = uv_pixel_bounds(image);
+    if right <= left || bottom <= top {
+        return (0, 0, Vec::new());
+    }
+
+    let width = right - left;
+    let height = bottom - top;
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+
+    for y in top..bottom {
+        for x in left..right {
+            let index = ((y * image.width + x) * 4) as usize;
+            let rgba = [
+                image.rgba[index],
+                image.rgba[index + 1],
+                image.rgba[index + 2],
+                image.rgba[index + 3],
+            ];
+            pixels.extend_from_slice(&shade_image_pixel(rgba, image.tint, image.bg_fill));
+        }
+    }
+
+    (width, height, pixels)
+}
+
+fn uv_pixel_bounds(image: &ImageSpan) -> (u32, u32, u32, u32) {
+    let mut u_min = f32::INFINITY;
+    let mut u_max = f32::NEG_INFINITY;
+    let mut v_min = f32::INFINITY;
+    let mut v_max = f32::NEG_INFINITY;
+
+    for [u, v] in image.uv {
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+
+    u_min = u_min.clamp(0.0, 1.0);
+    u_max = u_max.clamp(0.0, 1.0);
+    v_min = v_min.clamp(0.0, 1.0);
+    v_max = v_max.clamp(0.0, 1.0);
+
+    let left = (u_min * image.width as f32).floor() as u32;
+    let right = (u_max * image.width as f32).ceil() as u32;
+    let top = (v_min * image.height as f32).floor() as u32;
+    let bottom = (v_max * image.height as f32).ceil() as u32;
+
+    (
+        left.min(image.width),
+        right.min(image.width),
+        top.min(image.height),
+        bottom.min(image.height),
+    )
+}
+
+fn shade_image_pixel(rgba: [u8; 4], tint: Color, bg_fill: Color) -> [u8; 4] {
+    let sample = [
+        rgba[0] as f32 / 255.0 * tint.r,
+        rgba[1] as f32 / 255.0 * tint.g,
+        rgba[2] as f32 / 255.0 * tint.b,
+        rgba[3] as f32 / 255.0 * tint.a,
+    ];
+    let bg = [bg_fill.r, bg_fill.g, bg_fill.b, bg_fill.a];
+    let inv_alpha = 1.0 - sample[3];
+
+    [
+        normalized_to_u8(bg[0] * inv_alpha + sample[0]),
+        normalized_to_u8(bg[1] * inv_alpha + sample[1]),
+        normalized_to_u8(bg[2] * inv_alpha + sample[2]),
+        normalized_to_u8(bg[3] * inv_alpha + sample[3]),
+    ]
+}
+
+fn normalized_to_u8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn draw_highlights(frame: &mut Frame, state: &PlotState, bounds: Rectangle) {

@@ -35,7 +35,9 @@ use crate::{
     message::{
         CursorPositionUiPayload, PlotRenderUpdate, PlotViewBounds, PlotViewChange, TooltipUiPayload,
     },
-    picking, plot_overlay,
+    picking,
+    plot_image::PlotImage,
+    plot_overlay,
     plot_renderer::{PlotRenderStrategy, PlotRenderer, RenderParams},
     plot_state::PlotState,
     series::{SeriesError, ShapeId},
@@ -61,6 +63,7 @@ pub struct PlotWidget {
     pub(crate) instance_id: u64,
     // Data
     pub(crate) series: IndexMap<ShapeId, Series>,
+    pub(crate) images: IndexMap<ShapeId, PlotImage>,
     pub(crate) fills: IndexMap<ShapeId, Fill>,
     pub(crate) vlines: IndexMap<ShapeId, VLine>,
     pub(crate) hlines: IndexMap<ShapeId, HLine>,
@@ -68,6 +71,7 @@ pub struct PlotWidget {
     pub(crate) data_version: u64,
     // Configuration
     pub(crate) autoscale_on_updates: bool,
+    pub(crate) autoscale_y_on_updates: bool,
     pub(crate) controls: PlotControls,
     pub(crate) legend_enabled: bool,
     pub(crate) legend_collapsed: bool,
@@ -109,6 +113,10 @@ pub struct PlotWidget {
     pub(crate) shape_overlays_enabled: AtomicBool,
     // Camera and bounds for coordinate conversion (updated when ticks are updated)
     pub(crate) camera_bounds: Option<(Camera, Rectangle)>,
+    // Version for visible-content changes that may trigger y-axis autoscaling.
+    pub(crate) autoscale_source_version: u64,
+    // One-shot counter for explicit y-axis autoscale requests.
+    pub(crate) autoscale_y_request_version: u64,
 }
 
 impl Default for PlotWidget {
@@ -123,12 +131,14 @@ impl PlotWidget {
         Self {
             instance_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             series: IndexMap::new(),
+            images: IndexMap::new(),
             fills: IndexMap::new(),
             vlines: IndexMap::new(),
             hlines: IndexMap::new(),
             hidden_shapes: HashSet::new(),
             data_version: 1,
             autoscale_on_updates: false,
+            autoscale_y_on_updates: false,
             controls: PlotControls::default(),
             legend_enabled: true,
             legend_collapsed: false,
@@ -166,6 +176,8 @@ impl PlotWidget {
             cursor_ui: None,
             shape_overlays_enabled: AtomicBool::new(false),
             camera_bounds: None,
+            autoscale_source_version: 0,
+            autoscale_y_request_version: 0,
         }
     }
 
@@ -174,6 +186,15 @@ impl PlotWidget {
     pub fn add_series(&mut self, item: Series) -> Result<(), SeriesError> {
         item.validate()?;
         self.series.insert(item.id, item);
+        self.data_version += 1;
+        Ok(())
+    }
+
+    /// Add an image to the plot.
+    /// If there exists an image with the same `item.id` ([ShapeId]), the old one will be replaced.
+    pub fn add_image(&mut self, item: PlotImage) -> Result<(), SeriesError> {
+        item.validate()?;
+        self.images.insert(item.id, item);
         self.data_version += 1;
         Ok(())
     }
@@ -207,6 +228,17 @@ impl PlotWidget {
         }
     }
 
+    /// Remove an image from the plot by its ID.
+    pub fn remove_image(&mut self, id: &ShapeId) -> Result<(), SeriesError> {
+        if self.images.shift_remove(id).is_some() {
+            self.hidden_shapes.remove(id);
+            self.data_version += 1;
+            Ok(())
+        } else {
+            Err(SeriesError::NotFound(*id))
+        }
+    }
+
     /// Remove a fill from the plot by its ID.
     pub fn remove_fill(&mut self, id: &ShapeId) -> Result<(), SeriesError> {
         if self.fills.shift_remove(id).is_some() {
@@ -227,6 +259,26 @@ impl PlotWidget {
         if let Some(series) = self.series.get_mut(id) {
             f(series);
             self.data_version += 1;
+            self.autoscale_source_version = self.autoscale_source_version.wrapping_add(1);
+            Ok(())
+        } else {
+            Err(SeriesError::NotFound(*id))
+        }
+    }
+
+    /// Update an image by its ID.
+    pub fn update_image<F: FnMut(&mut PlotImage)>(
+        &mut self,
+        id: &ShapeId,
+        mut f: F,
+    ) -> Result<(), SeriesError> {
+        if let Some(image) = self.images.get(id) {
+            let mut updated = image.clone();
+            f(&mut updated);
+            updated.validate()?;
+            self.images.insert(*id, updated);
+            self.data_version += 1;
+            self.autoscale_source_version = self.autoscale_source_version.wrapping_add(1);
             Ok(())
         } else {
             Err(SeriesError::NotFound(*id))
@@ -323,7 +375,7 @@ impl PlotWidget {
         }
     }
 
-    pub fn viewport_height(&self ) -> f32 {
+    pub fn viewport_height(&self) -> f32 {
         if let Some(bounds) = self.camera_bounds {
             bounds.1.height
         } else {
@@ -460,6 +512,11 @@ impl PlotWidget {
     pub fn series_ids(&self) -> Vec<ShapeId> {
         self.series.keys().copied().collect()
     }
+
+    pub fn image_ids(&self) -> Vec<ShapeId> {
+        self.images.keys().copied().collect()
+    }
+
     /// Get the position of a point in the plot.
     pub fn point_position(&self, point_id: PointId) -> Option<[f64; 2]> {
         self.series
@@ -816,9 +873,26 @@ impl PlotWidget {
         self.autoscale_on_updates = enabled;
     }
 
+    /// Enable or disable y-axis autoscaling on content updates.
+    ///
+    /// When enabled, content updates that touch displayed geometry (series positions,
+    /// image data, or visibility) will queue a y-only autoscale against the current
+    /// visible x-range.
+    pub fn autoscale_y_on_updates(&mut self, enabled: bool) {
+        self.autoscale_y_on_updates = enabled;
+    }
+
     /// Set hover radius in logical pixels for picking markers (default: 8 px)
     pub fn hover_radius_px(&mut self, radius: f32) {
         self.hover_radius_px = radius.max(0.0);
+    }
+
+    /// Queue a y-only autoscale using the current visible x-range as the filter.
+    ///
+    /// The autoscale is applied in the next plot update, even if plot data has not
+    /// otherwise changed.
+    pub fn autoscale_y_to_visible_x(&mut self) {
+        self.autoscale_y_request_version = self.autoscale_y_request_version.wrapping_add(1);
     }
 
     /// Set a custom highlighter for picked point.
@@ -897,6 +971,7 @@ impl PlotWidget {
                 colors.resize(series.positions.len(), series.color);
             }
             self.data_version += 1;
+            self.autoscale_source_version = self.autoscale_source_version.wrapping_add(1);
         }
     }
 
@@ -908,6 +983,15 @@ impl PlotWidget {
             }
             series.point_colors = Some(colors);
             self.data_version += 1;
+        }
+    }
+
+    /// Replace an image
+    pub fn set_image(&mut self, id: &ShapeId, new_image: PlotImage) {
+        if let Some(image) = self.images.get_mut(id) {
+            *image = new_image;
+            self.data_version += 1;
+            self.autoscale_source_version = self.autoscale_source_version.wrapping_add(1);
         }
     }
 
@@ -937,6 +1021,21 @@ impl PlotWidget {
                         hidden: self.hidden_shapes.contains(id),
                     });
                 }
+            }
+        }
+        // Add images to legend
+        for (id, image) in &self.images {
+            if let Some(ref label) = image.label
+                && !label.is_empty()
+            {
+                out.push(LegendEntry {
+                    id: *id,
+                    label: label.clone(),
+                    color: image.tint,
+                    _marker: u32::MAX,
+                    _line_style: None,
+                    hidden: self.hidden_shapes.contains(id),
+                });
             }
         }
         // Add vertical reference lines to legend
@@ -1106,6 +1205,8 @@ impl PlotWidget {
         }
         if self.controls.zoom.double_click_autoscale {
             content = content.push(txt("Double-click: reset / autoscale"));
+        } else if self.controls.zoom.double_click_autoscale_y {
+            content = content.push(txt("Double-click: autoscale y"));
         }
         if self.controls.pick.click_to_pick {
             content = content.push(txt("Left-click point: pick"));
@@ -1189,6 +1290,7 @@ impl PlotWidget {
 
     fn toggle_visibility(&mut self, id: &ShapeId) {
         let exists = self.series.contains_key(id)
+            || self.images.contains_key(id)
             || self.fills.contains_key(id)
             || self.vlines.contains_key(id)
             || self.hlines.contains_key(id);
@@ -1202,6 +1304,7 @@ impl PlotWidget {
             self.hidden_shapes.insert(*id);
         }
         self.data_version += 1;
+        self.autoscale_source_version = self.autoscale_source_version.wrapping_add(1);
     }
 
     fn is_fill_endpoint_available(&self, id: ShapeId) -> bool {
@@ -1215,6 +1318,11 @@ impl PlotWidget {
             .get(&id)
             .map(|series| &series.transform)
             .is_some_and(PositionTransform::uses_axes_coordinates)
+            || self
+                .images
+                .get(&id)
+                .map(|image| &image.transform)
+                .is_some_and(PositionTransform::uses_axes_coordinates)
             || self
                 .vlines
                 .get(&id)
@@ -1230,6 +1338,8 @@ impl PlotWidget {
     fn has_visible_dynamic_geometry_transforms(&self) -> bool {
         self.series.iter().any(|(id, series)| {
             !self.hidden_shapes.contains(id) && series.transform.uses_axes_coordinates()
+        }) || self.images.iter().any(|(id, image)| {
+            !self.hidden_shapes.contains(id) && image.transform.uses_axes_coordinates()
         }) || self.fills.iter().any(|(id, fill)| {
             !self.hidden_shapes.contains(id)
                 && !self.hidden_shapes.contains(&fill.begin)
@@ -1559,6 +1669,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
     let limits_changed = widget.x_lim != state.x_lim || widget.y_lim != state.y_lim;
     let instance_switched = state.source_instance_id != Some(widget.instance_id);
     let first_time_widget_view = instance_switched && widget.camera_bounds.is_none();
+    let mut should_autoscale_y = false;
 
     if widget.data_version != state.data_src_version || instance_switched {
         // Rebuild derived state from widget data.
@@ -1588,6 +1699,21 @@ fn update_plot_program<const IS_CANVAS: bool>(
         state.x_lim = widget.x_lim;
         state.y_lim = widget.y_lim;
         state.autoscale(true);
+        effects.needs_redraw = true;
+        invalidation.all();
+    }
+
+    if widget.autoscale_source_version != state.autoscale_source_version {
+        should_autoscale_y |= widget.autoscale_y_on_updates;
+        state.autoscale_source_version = widget.autoscale_source_version;
+    }
+    if widget.autoscale_y_request_version != state.autoscale_y_request_version {
+        should_autoscale_y = true;
+        state.autoscale_y_request_version = widget.autoscale_y_request_version;
+    }
+
+    if should_autoscale_y {
+        state.autoscale_y_to_visible_x(!first_time_widget_view);
         effects.needs_redraw = true;
         invalidation.all();
     }

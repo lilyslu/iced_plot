@@ -29,6 +29,15 @@ struct VertexBuffer {
     vertex_count: u32,
 }
 
+/// Helper struct for one uploaded plot image.
+struct ImageBuffer {
+    buffer: Buffer,
+    vertex_count: u32,
+    bind_group: BindGroup,
+    _texture: Texture,
+    _view: TextureView,
+}
+
 /// Helper struct for managing line vertex buffers
 struct LineBuffer {
     buffer: Buffer,
@@ -64,6 +73,7 @@ struct PolylineRef<'a> {
 
 /// Cache for render pipelines
 struct PipelineCache {
+    image: Option<RenderPipeline>,
     marker: Option<RenderPipeline>,
     line: Option<RenderPipeline>,
     fill: Option<RenderPipeline>,
@@ -74,6 +84,7 @@ struct PipelineCache {
 impl PipelineCache {
     fn new() -> Self {
         Self {
+            image: None,
             marker: None,
             line: None,
             fill: None,
@@ -85,6 +96,7 @@ impl PipelineCache {
 
 /// Cache for vertex buffers
 struct BufferCache {
+    images: Vec<ImageBuffer>,
     markers: Option<VertexBuffer>,
     fills: Option<VertexBuffer>,
     lines: Option<LineBuffer>,
@@ -98,6 +110,7 @@ struct BufferCache {
 impl BufferCache {
     fn new() -> Self {
         Self {
+            images: Vec::new(),
             markers: None,
             fills: None,
             lines: None,
@@ -112,6 +125,7 @@ impl BufferCache {
 
 /// Tracks version numbers to detect changes
 struct VersionTracker {
+    images: u64,
     markers: u64,
     fills: u64,
     lines: u64,
@@ -122,6 +136,7 @@ struct VersionTracker {
 impl VersionTracker {
     fn new() -> Self {
         Self {
+            images: 0,
             markers: 0,
             fills: 0,
             lines: 0,
@@ -158,6 +173,11 @@ impl VertexWriter {
     fn write_position(&mut self, pos: [f32; 2]) {
         self.write_f32(pos[0]);
         self.write_f32(pos[1]);
+    }
+
+    fn write_uv(&mut self, uv: [f32; 2]) {
+        self.write_f32(uv[0]);
+        self.write_f32(uv[1]);
     }
 
     fn write_color(&mut self, color: &iced::Color) {
@@ -199,6 +219,8 @@ pub struct PlotRenderer {
     camera_buffer: Buffer,
     camera_bind_group: BindGroup,
     camera_bgl: BindGroupLayout,
+    image_bgl: BindGroupLayout,
+    image_sampler: Sampler,
     // Caches
     pipelines: PipelineCache,
     buffers: BufferCache,
@@ -241,11 +263,44 @@ impl PlotRenderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
+        let image_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("plot image bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: TextureViewDimension::D2,
+                        sample_type: TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let image_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("plot image sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: FilterMode::Nearest,
+            ..SamplerDescriptor::default()
+        });
         Self {
             format,
             camera_buffer,
             camera_bind_group,
             camera_bgl,
+            image_bgl,
+            image_sampler,
             pipelines: PipelineCache::new(),
             buffers: BufferCache::new(),
             versions: VersionTracker::new(),
@@ -304,6 +359,9 @@ impl PlotRenderer {
         _queue: &Queue,
         state: &PlotState,
     ) {
+        if !state.images.is_empty() {
+            self.ensure_image_pipeline(device);
+        }
         self.ensure_marker_pipeline(device);
         self.grid
             .ensure_pipeline(device, self.format, &self.camera_bgl);
@@ -333,6 +391,10 @@ impl PlotRenderer {
         // since positions are stored relative to render_offset
         let offset_changed = self.versions.render_offset != state.camera.render_offset;
 
+        if state.images_version != self.versions.images || offset_changed {
+            self.rebuild_images(device, queue, state);
+            self.versions.images = state.images_version;
+        }
         if state.markers_version != self.versions.markers || offset_changed {
             self.rebuild_markers(device, queue, state);
             self.versions.markers = state.markers_version;
@@ -505,6 +567,78 @@ impl PlotRenderer {
             cache: None,
         });
         self.pipelines.marker = Some(pipeline);
+    }
+
+    pub fn ensure_image_pipeline(&mut self, device: &Device) {
+        if self.pipelines.image.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("../shaders/plot_image.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("plot image layout"),
+            bind_group_layouts: &[&self.camera_bgl, &self.image_bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("plot image pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    // vec2 position + vec2 uv + vec4 tint + vec4 bg_fill
+                    array_stride: 48,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: VertexFormat::Float32x2,
+                        },
+                        VertexAttribute {
+                            offset: 16,
+                            shader_location: 2,
+                            format: VertexFormat::Float32x4,
+                        },
+                        VertexAttribute {
+                            offset: 32,
+                            shader_location: 3,
+                            format: VertexFormat::Float32x4,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: self.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        self.pipelines.image = Some(pipeline);
     }
 
     pub fn ensure_line_pipeline(&mut self, device: &Device) {
@@ -875,6 +1009,93 @@ impl PlotRenderer {
 
         // Update picking id map
         self.picking.set_id_map(id_map);
+    }
+
+    fn rebuild_images(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        self.buffers.images.clear();
+        if state.images.is_empty() {
+            return;
+        }
+
+        for image in state.images.iter() {
+            let mut writer = VertexWriter::with_capacity(4 * 48);
+            for index in 0..4 {
+                let render_pos = self.world_to_render_pos(image.vertices[index], &state.camera);
+                writer.write_position(render_pos);
+                writer.write_uv(image.uv[index]);
+                writer.write_color(&image.tint);
+                writer.write_color(&image.bg_fill);
+            }
+
+            let texture_label = format!("plot image texture {}", image.id);
+            let texture = device.create_texture(&TextureDescriptor {
+                label: Some(texture_label.as_str()),
+                size: Extent3d {
+                    width: image.width,
+                    height: image.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                image.rgba.as_ref(),
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * image.width),
+                    rows_per_image: Some(image.height),
+                },
+                Extent3d {
+                    width: image.width,
+                    height: image.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let view = texture.create_view(&TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&BindGroupDescriptor {
+                label: Some("plot image bind group"),
+                layout: &self.image_bgl,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&view),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Sampler(&self.image_sampler),
+                    },
+                ],
+            });
+
+            let data = writer.as_slice();
+            let buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("plot image vb"),
+                size: data.len() as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&buffer, 0, data);
+
+            self.buffers.images.push(ImageBuffer {
+                buffer,
+                vertex_count: 4,
+                bind_group,
+                _texture: texture,
+                _view: view,
+            });
+        }
     }
 
     fn rebuild_fills(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
@@ -1369,6 +1590,16 @@ impl PlotRenderer {
 
             // grid
             self.grid.draw(&mut pass, &self.camera_bind_group);
+            // images
+            if let Some(pipeline) = self.pipelines.image.as_ref() {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for image in &self.buffers.images {
+                    pass.set_bind_group(1, &image.bind_group, &[]);
+                    pass.set_vertex_buffer(0, image.buffer.slice(..));
+                    pass.draw(0..image.vertex_count, 0..1);
+                }
+            }
             // fills
             if let (Some(pipeline), Some(vb)) = (self.pipelines.fill.as_ref(), &self.buffers.fills)
             {

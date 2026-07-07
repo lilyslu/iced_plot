@@ -13,6 +13,7 @@ use crate::{
     axis_scale::plot_point_to_data,
     camera::Camera,
     picking::PickingState,
+    plot_image::PlotImage,
     plot_widget::{HighlightPoint, world_to_screen_position_x, world_to_screen_position_y},
     style::GridStyle,
     ticks::{PositionedTick, TickFormatter, TickProducer},
@@ -29,6 +30,7 @@ pub struct PlotState {
     pub(crate) points: Arc<[Point]>,       // vertex/instance data
     pub(crate) point_colors: Arc<[Color]>, // per-point colors (matches points)
     pub(crate) series: Arc<[SeriesSpan]>,  // spans describing logical series
+    pub(crate) images: Arc<[ImageSpan]>,   // image quads in plot/world coordinates
     pub(crate) fills: Arc<[FillSpan]>,     // triangulated fill spans
     pub(crate) vlines: Arc<[VLine]>,       // vertical reference lines
     pub(crate) hlines: Arc<[HLine]>,       // horizontal reference lines
@@ -62,11 +64,14 @@ pub struct PlotState {
     pub(crate) highlighted_points: Arc<[HighlightPoint]>,
     // Version counters
     pub(crate) markers_version: u64,
+    pub(crate) images_version: u64,
     pub(crate) lines_version: u64,
     pub(crate) fills_version: u64,
     pub(crate) highlight_version: u64,
     pub(crate) data_src_version: u64, // version of source data last synced
     pub(crate) source_instance_id: Option<u64>,
+    pub(crate) autoscale_source_version: u64,
+    pub(crate) autoscale_y_request_version: u64,
     // Hover/picking internals
     pub(crate) hover_enabled: bool,
     pub(crate) pick_enabled: bool,
@@ -87,6 +92,7 @@ impl Default for PlotState {
             point_colors: Arc::new([]),
             highlighted_points: Arc::new([]),
             series: Arc::new([]),
+            images: Arc::new([]),
             fills: Arc::new([]),
             vlines: Arc::new([]),
             hlines: Arc::new([]),
@@ -111,9 +117,12 @@ impl Default for PlotState {
             pan: PanState::default(),
             drag: DragState::default(),
             markers_version: 1,
+            images_version: 1,
             lines_version: 1,
             fills_version: 1,
             highlight_version: 0,
+            autoscale_source_version: 0,
+            autoscale_y_request_version: 0,
             hover_enabled: true,
             pick_enabled: true,
             hover_radius_px: 8.0,
@@ -152,6 +161,7 @@ impl PlotState {
         let mut points = Vec::new();
         let mut point_colors = Vec::new();
         let mut series_spans = Vec::new();
+        let mut image_spans = Vec::new();
         let mut data_min_x: Option<f64> = None;
         let mut data_max_x: Option<f64> = None;
         let mut data_min_y: Option<f64> = None;
@@ -268,6 +278,43 @@ impl PlotState {
             }
         }
 
+        for (id, image) in &widget.images {
+            if widget.hidden_shapes.contains(id) {
+                continue;
+            }
+
+            let Some(span) =
+                build_image_span(image, widget.x_axis_scale, widget.y_axis_scale, axis_ranges)
+            else {
+                continue;
+            };
+
+            let x_uses_axes = image
+                .transform
+                .x
+                .as_ref()
+                .is_some_and(|transform| transform.uses_axes_coordinates());
+            let y_uses_axes = image
+                .transform
+                .y
+                .as_ref()
+                .is_some_and(|transform| transform.uses_axes_coordinates());
+
+            for point in span.vertices {
+                include_point_in_bounds(
+                    &mut data_min_x,
+                    &mut data_max_x,
+                    &mut data_min_y,
+                    &mut data_max_y,
+                    point,
+                    !x_uses_axes,
+                    !y_uses_axes,
+                );
+            }
+
+            image_spans.push(span);
+        }
+
         let data_min = (data_min_x.is_some() || data_min_y.is_some())
             .then(|| DVec2::new(data_min_x.unwrap_or(-1.0), data_min_y.unwrap_or(-1.0)));
         let data_max = (data_max_x.is_some() || data_max_y.is_some())
@@ -316,6 +363,7 @@ impl PlotState {
         self.points = points.into();
         self.point_colors = point_colors.into();
         self.series = series_spans.into();
+        self.images = image_spans.into();
         self.fills = fills.into();
         self.vlines = vlines.into();
         self.hlines = hlines.into();
@@ -339,6 +387,7 @@ impl PlotState {
         // Force GPU buffers to rebuild only when data actually changes
         // (not when only hover/pick changes - that's tracked by highlight_version)
         self.markers_version = self.markers_version.wrapping_add(1);
+        self.images_version = self.images_version.wrapping_add(1);
         self.lines_version = self.lines_version.wrapping_add(1);
         self.fills_version = self.fills_version.wrapping_add(1);
     }
@@ -377,6 +426,139 @@ impl PlotState {
         if update_axis_links {
             self.update_axis_links();
         }
+    }
+
+    pub(crate) fn autoscale_y_to_visible_x(&mut self, update_axis_links: bool) {
+        const AUTO_SCALE_PADDING: f64 = 0.05;
+        let [visible_min_x, visible_max_x] = self.camera.x_range();
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+
+        let add_y = |y: f64, min_y: &mut f64, max_y: &mut f64| {
+            if y.is_finite() {
+                *min_y = min_y.min(y);
+                *max_y = max_y.max(y);
+            }
+        };
+
+        // Preserve all horizontal camera state to ensure this is y-only scaling.
+        let (position_x, half_extent_x, render_offset_x) = (
+            self.camera.position.x,
+            self.camera.half_extents.x,
+            self.camera.render_offset.x,
+        );
+
+        for series in self.series.iter() {
+            let Some(span_points) = self
+                .points
+                .get(series.start..series.start.saturating_add(series.len))
+            else {
+                continue;
+            };
+            if span_points.is_empty() {
+                continue;
+            }
+
+            if series.line_style.is_some() {
+                for point in span_points {
+                    let [x, y] = point.position;
+                    if x.is_finite()
+                        && y.is_finite()
+                        && (visible_min_x..=visible_max_x).contains(&x)
+                    {
+                        add_y(y, &mut min_y, &mut max_y);
+                    }
+                }
+
+                for index in 1..span_points.len() {
+                    let break_segment = series
+                        .point_indices
+                        .get(index)
+                        .zip(series.point_indices.get(index - 1))
+                        .is_some_and(|(curr, prev)| *curr != *prev + 1);
+                    if break_segment {
+                        continue;
+                    }
+
+                    let p0 = span_points[index - 1].position;
+                    let p1 = span_points[index].position;
+                    if !p0[0].is_finite()
+                        || !p0[1].is_finite()
+                        || !p1[0].is_finite()
+                        || !p1[1].is_finite()
+                    {
+                        continue;
+                    }
+
+                    let segment_min_x = p0[0].min(p1[0]);
+                    let segment_max_x = p0[0].max(p1[0]);
+                    if segment_max_x < visible_min_x || segment_min_x > visible_max_x {
+                        continue;
+                    }
+
+                    if (visible_min_x..=visible_max_x).contains(&p0[0]) {
+                        add_y(p0[1], &mut min_y, &mut max_y);
+                    }
+                    if (visible_min_x..=visible_max_x).contains(&p1[0]) {
+                        add_y(p1[1], &mut min_y, &mut max_y);
+                    }
+
+                    if segment_min_x < visible_min_x && segment_max_x > visible_min_x {
+                        if let Some(intersection) = Self::line_y_at_x(p0, p1, visible_min_x) {
+                            add_y(intersection, &mut min_y, &mut max_y);
+                        }
+                    }
+                    if segment_min_x < visible_max_x && segment_max_x > visible_max_x {
+                        if let Some(intersection) = Self::line_y_at_x(p0, p1, visible_max_x) {
+                            add_y(intersection, &mut min_y, &mut max_y);
+                        }
+                    }
+                }
+            } else {
+                for point in span_points {
+                    let [x, y] = point.position;
+                    if !x.is_finite() || !y.is_finite() {
+                        continue;
+                    }
+                    if (visible_min_x..=visible_max_x).contains(&x) {
+                        add_y(y, &mut min_y, &mut max_y);
+                    }
+                }
+            }
+        }
+
+        if !min_y.is_finite() || !max_y.is_finite() {
+            return;
+        }
+
+        let size = (max_y - min_y).max(1e-12);
+        let padded_half_y = (size * (1.0 + AUTO_SCALE_PADDING)) / 2.0;
+        let center_y = (max_y + min_y) / 2.0;
+
+        self.camera.position = DVec2::new(position_x, center_y);
+        self.camera.half_extents = DVec2::new(half_extent_x, padded_half_y);
+        self.camera.render_offset.x = render_offset_x;
+
+        if update_axis_links {
+            if let Some(ref link) = self.y_axis_link {
+                link.set(self.camera.position.y, self.camera.half_extents.y);
+                self.y_link_version = link.version();
+            }
+        }
+    }
+
+    fn line_y_at_x(p0: [f64; 2], p1: [f64; 2], x: f64) -> Option<f64> {
+        let (x0, y0) = (p0[0], p0[1]);
+        let (x1, y1) = (p1[0], p1[1]);
+        let dx = x1 - x0;
+        if dx.abs() <= f64::EPSILON {
+            return None;
+        }
+        let t = (x - x0) / dx;
+        if !(0.0..=1.0).contains(&t) {
+            return None;
+        }
+        Some(y0 + (y1 - y0) * t)
     }
 
     pub(crate) fn update_ticks(
@@ -557,9 +739,14 @@ impl PlotState {
                     false
                 };
                 self.last_click_time = Some(now);
-                if double && widget.controls.zoom.double_click_autoscale {
-                    self.autoscale(true);
-                    needs_redraw = true;
+                if double {
+                    if widget.controls.zoom.double_click_autoscale {
+                        self.autoscale(true);
+                        needs_redraw = true;
+                    } else if widget.controls.zoom.double_click_autoscale_y {
+                        self.autoscale_y_to_visible_x(true);
+                        needs_redraw = true;
+                    }
                 } else {
                     if self.pick_enabled
                         && widget.controls.pick.click_to_pick
@@ -737,6 +924,81 @@ impl PlotState {
         );
         plot_point_to_data([plot.x, plot.y], self.x_axis_scale, self.y_axis_scale)
     }
+}
+
+fn include_point_in_bounds(
+    data_min_x: &mut Option<f64>,
+    data_max_x: &mut Option<f64>,
+    data_min_y: &mut Option<f64>,
+    data_max_y: &mut Option<f64>,
+    point: [f64; 2],
+    include_x: bool,
+    include_y: bool,
+) {
+    if include_x {
+        *data_min_x = Some(data_min_x.map_or(point[0], |min| min.min(point[0])));
+        *data_max_x = Some(data_max_x.map_or(point[0], |max| max.max(point[0])));
+    }
+    if include_y {
+        *data_min_y = Some(data_min_y.map_or(point[1], |min| min.min(point[1])));
+        *data_max_y = Some(data_max_y.map_or(point[1], |max| max.max(point[1])));
+    }
+}
+
+fn build_image_span(
+    image: &PlotImage,
+    x_axis_scale: AxisScale,
+    y_axis_scale: AxisScale,
+    axis_ranges: ([f64; 2], [f64; 2]),
+) -> Option<ImageSpan> {
+    let (min, max) = image.bounds();
+    let source_vertices = [
+        [min[0], min[1]],
+        [max[0], min[1]],
+        [min[0], max[1]],
+        [max[0], max[1]],
+    ];
+    let mut vertices = [[0.0; 2]; 4];
+    for (index, point) in source_vertices.iter().enumerate() {
+        vertices[index] = data_point_to_plot_with_transform(
+            *point,
+            x_axis_scale,
+            y_axis_scale,
+            &image.transform,
+            Some(axis_ranges),
+        )?;
+    }
+
+    let [[u_min, v_min], [u_max, v_max]] = image.uv;
+    Some(ImageSpan {
+        id: image.id,
+        width: image.width,
+        height: image.height,
+        rgba: Arc::clone(&image.rgba),
+        vertices,
+        uv: [
+            [u_min, v_max],
+            [u_max, v_max],
+            [u_min, v_min],
+            [u_max, v_min],
+        ],
+        tint: image.tint,
+        bg_fill: image.bg_fill,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ImageSpan {
+    pub(crate) id: ShapeId,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Arc<[u8]>,
+    /// Quad vertices in plot/world coordinates, ordered for triangle strip.
+    pub(crate) vertices: [[f64; 2]; 4],
+    /// Normalized UVs matching `vertices`.
+    pub(crate) uv: [[f32; 2]; 4],
+    pub(crate) tint: Color,
+    pub(crate) bg_fill: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -1100,7 +1362,7 @@ mod tests {
     use glam::DVec2;
 
     use super::*;
-    use crate::Series;
+    use crate::{LineStyle, PlotImage, Series};
 
     #[test]
     fn axes_transform_series_maps_to_camera_range_and_skips_autoscale_bounds() {
@@ -1118,5 +1380,101 @@ mod tests {
         assert_eq!(state.points[0].position, [9.0, 22.0]);
         assert_eq!(state.data_min, None);
         assert_eq!(state.data_max, None);
+    }
+
+    #[test]
+    fn plot_image_contributes_bounds_and_render_span() {
+        let rgba = vec![255; 2 * 2 * 4];
+        let image = PlotImage::from_rgba_bounds(2, 2, rgba, [10.0, 2.0], [20.0, 6.0]);
+        let image_id = image.id;
+
+        let mut widget = PlotWidget::new();
+        widget.add_image(image).unwrap();
+
+        let mut state = PlotState::default();
+        state.rebuild_from_widget(&widget);
+
+        assert_eq!(state.data_min, Some(DVec2::new(10.0, 2.0)));
+        assert_eq!(state.data_max, Some(DVec2::new(20.0, 6.0)));
+        assert_eq!(state.images.len(), 1);
+        assert_eq!(state.images[0].id, image_id);
+        assert_eq!(
+            state.images[0].vertices,
+            [[10.0, 2.0], [20.0, 2.0], [10.0, 6.0], [20.0, 6.0]]
+        );
+        assert_eq!(
+            state.images[0].uv,
+            [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0], [1.0, 0.0]]
+        );
+    }
+
+    #[test]
+    fn autoscale_y_to_visible_x_uses_visible_line_intersections() {
+        let mut widget = PlotWidget::new();
+        let series = Series::line_only(
+            vec![[0.0, 0.0], [2.0, 10.0], [4.0, 0.0], [8.0, 20.0]],
+            LineStyle::solid(),
+        )
+        .with_label("signal");
+        widget.add_series(series).unwrap();
+
+        let mut state = PlotState::default();
+        state.camera.position = DVec2::new(2.0, 0.0);
+        state.camera.half_extents = DVec2::new(4.0, 2.0);
+        state.rebuild_from_widget(&widget);
+
+        // Visible x range will be [-2, 6], so this samples both markers and an interpolated
+        // y value at the leading edge.
+        state.autoscale_y_to_visible_x(false);
+
+        assert_eq!(state.camera.position.x, 2.0);
+        assert_eq!(state.camera.half_extents.x, 4.0);
+        assert!((state.camera.position.y - 5.0).abs() < 1e-6);
+        assert!((state.camera.half_extents.y - 5.25).abs() < 1e-6);
+        assert_eq!(state.camera.render_offset.x, 0.0);
+    }
+
+    #[test]
+    fn autoscale_y_to_visible_x_respects_na_n_gaps() {
+        let mut widget = PlotWidget::new();
+        let series = Series::line_only(
+            vec![[0.0, 1.0], [1.0, f64::NAN], [2.0, 11.0], [3.0, 21.0]],
+            LineStyle::solid(),
+        )
+        .with_label("signal");
+        widget.add_series(series).unwrap();
+
+        let mut state = PlotState::default();
+        state.camera.position = DVec2::new(2.0, 0.0);
+        state.camera.half_extents = DVec2::new(5.0, 2.0);
+        state.rebuild_from_widget(&widget);
+        state.autoscale_y_to_visible_x(false);
+
+        // NaN should break line continuity for the 0..1 segment and not introduce an
+        // interpolation across the gap.
+        assert!((state.camera.position.y - 11.0).abs() < 1e-6);
+        assert!((state.camera.half_extents.y - 10.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn autoscale_y_to_visible_x_does_not_interpolate_across_na_n_gap() {
+        let mut widget = PlotWidget::new();
+        let series = Series::line_only(
+            vec![[0.0, 0.0], [1.0, f64::NAN], [2.0, 20.0]],
+            LineStyle::solid(),
+        )
+        .with_label("signal");
+        widget.add_series(series).unwrap();
+
+        let mut state = PlotState::default();
+        state.camera.position = DVec2::new(1.0, 100.0);
+        state.camera.half_extents = DVec2::new(0.25, 7.0);
+        state.rebuild_from_widget(&widget);
+        state.autoscale_y_to_visible_x(false);
+
+        // The visible x range is [0.75, 1.25]. It only intersects the skipped NaN
+        // gap, so y autoscale should have no finite rendered series data to use.
+        assert_eq!(state.camera.position.y, 100.0);
+        assert_eq!(state.camera.half_extents.y, 7.0);
     }
 }

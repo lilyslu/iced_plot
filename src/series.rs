@@ -238,12 +238,18 @@ pub enum SeriesError {
     InvalidFillEndpoints,
     /// Fill endpoint references a shape that does not exist in the widget.
     FillEndpointNotFound(ShapeId),
+    /// Image width/height must be non-zero.
+    InvalidImageDimensions,
+    /// Image RGBA data length must equal `width * height * 4`.
+    InvalidImageDataLength { expected: usize, actual: usize },
+    /// Image center, size, and UV values must be finite, and size must be positive.
+    InvalidImageGeometry,
 }
 
 /// Unique identifier for a shape in the plot.
 ///
 /// You can obtain the [ShapeId] of [Series], [VLine](crate::VLine), [HLine](crate::HLine),
-/// or [Fill](crate::Fill) by `id` field:
+/// [Fill](crate::Fill), or [PlotImage](crate::PlotImage) by `id` field:
 /// ```rust
 /// use iced_plot::{Series, VLine, HLine, MarkerStyle, LineStyle};
 /// let series = Series::new(
