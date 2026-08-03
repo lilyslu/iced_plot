@@ -83,6 +83,8 @@ pub struct PlotWidget {
     pub(crate) y_axis_scale: AxisScale,
     pub(crate) x_axis_link: Option<AxisLink>,
     pub(crate) y_axis_link: Option<AxisLink>,
+    pub(crate) x_axis_link_offset: f64,
+    pub(crate) x_axis_link_offset_version: u64,
     pub(crate) hover_radius_px: f32,
     pub(crate) pick_highlight_provider: Option<HighlightPointProvider>,
     pub(crate) hover_highlight_provider: Option<HighlightPointProvider>,
@@ -150,6 +152,8 @@ impl PlotWidget {
             y_axis_scale: AxisScale::Linear,
             x_axis_link: None,
             y_axis_link: None,
+            x_axis_link_offset: 0.0,
+            x_axis_link_offset_version: 0,
             hover_radius_px: 8.0,
             pick_highlight_provider: None,
             hover_highlight_provider: None,
@@ -359,6 +363,19 @@ impl PlotWidget {
     /// all plots sharing this link will update synchronously.
     pub fn set_x_axis_link(&mut self, link: AxisLink) {
         self.x_axis_link = Some(link);
+    }
+
+    /// Set the translation from this plot's local x coordinates to its shared
+    /// x-axis link coordinates.
+    ///
+    /// Linked coordinates are calculated as `local_x + offset`. Receiving a
+    /// linked position applies the inverse translation. Non-finite offsets are
+    /// ignored.
+    pub fn set_x_axis_link_offset(&mut self, offset: f64) {
+        if offset.is_finite() && self.x_axis_link_offset != offset {
+            self.x_axis_link_offset = offset;
+            self.x_axis_link_offset_version = self.x_axis_link_offset_version.wrapping_add(1);
+        }
     }
 
     /// Link the y-axis to other plots. When the y-axis is panned or zoomed,
@@ -1669,6 +1686,15 @@ fn update_plot_program<const IS_CANVAS: bool>(
     let limits_changed = widget.x_lim != state.x_lim || widget.y_lim != state.y_lim;
     let instance_switched = state.source_instance_id != Some(widget.instance_id);
     let first_time_widget_view = instance_switched && widget.camera_bounds.is_none();
+    let x_axis_link_offset_changed = instance_switched
+        || widget.x_axis_link_offset_version != state.x_axis_link_offset_version
+        || widget.x_axis_link_offset.to_bits() != state.x_axis_link_offset.to_bits();
+    if x_axis_link_offset_changed {
+        state.x_axis_link_offset = widget.x_axis_link_offset;
+        state.x_axis_link_offset_version = widget.x_axis_link_offset_version;
+        effects.needs_redraw = true;
+        invalidation.all();
+    }
     let mut should_autoscale_y = false;
 
     if widget.data_version != state.data_src_version || instance_switched {
@@ -1721,11 +1747,19 @@ fn update_plot_program<const IS_CANVAS: bool>(
     // Check if axis links have been updated by other plots.
     if let Some(ref link) = state.x_axis_link {
         let link_version = link.version();
-        if link_version != state.x_link_version {
+        if link_version != state.x_link_version || x_axis_link_offset_changed {
             let (position, half_extent, version) = link.get();
-            state.camera.position.x = position;
-            state.camera.half_extents.x = half_extent;
-            state.x_link_version = version;
+            if version == 0 {
+                link.set(
+                    state.camera.position.x + state.x_axis_link_offset,
+                    state.camera.half_extents.x,
+                );
+                state.x_link_version = link.version();
+            } else {
+                state.camera.position.x = position - state.x_axis_link_offset;
+                state.camera.half_extents.x = half_extent;
+                state.x_link_version = version;
+            }
             effects.needs_redraw = true;
             invalidation.all();
         }

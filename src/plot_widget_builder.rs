@@ -49,6 +49,7 @@ pub struct PlotWidgetBuilder {
     x_axis_scale: Option<AxisScale>,
     y_axis_scale: Option<AxisScale>,
     x_axis_link: Option<AxisLink>,
+    x_axis_link_offset: Option<f64>,
     y_axis_link: Option<AxisLink>,
     x_tick_formatter: Option<TickFormatter>,
     y_tick_formatter: Option<TickFormatter>,
@@ -227,6 +228,18 @@ impl PlotWidgetBuilder {
     /// all plots sharing this link will update synchronously.
     pub fn with_x_axis_link(mut self, link: AxisLink) -> Self {
         self.x_axis_link = Some(link);
+        self
+    }
+
+    /// Set the translation from this plot's local x coordinates to its shared
+    /// x-axis link coordinates.
+    ///
+    /// Linked coordinates are calculated as `local_x + offset`. Non-finite
+    /// offsets are ignored.
+    pub fn with_x_axis_link_offset(mut self, offset: f64) -> Self {
+        if offset.is_finite() {
+            self.x_axis_link_offset = Some(offset);
+        }
         self
     }
 
@@ -453,6 +466,9 @@ impl PlotWidgetBuilder {
         }
         if let Some(link) = self.x_axis_link {
             w.set_x_axis_link(link);
+        }
+        if let Some(offset) = self.x_axis_link_offset {
+            w.set_x_axis_link_offset(offset);
         }
         if let Some(link) = self.y_axis_link {
             w.set_y_axis_link(link);

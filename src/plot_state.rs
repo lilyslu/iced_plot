@@ -46,6 +46,8 @@ pub struct PlotState {
     pub(crate) y_axis_link: Option<AxisLink>,
     pub(crate) x_link_version: u64,
     pub(crate) y_link_version: u64,
+    pub(crate) x_axis_link_offset: f64,
+    pub(crate) x_axis_link_offset_version: u64,
     // UI / camera
     pub(crate) camera: Camera,
     pub(crate) bounds: Rectangle,
@@ -106,6 +108,8 @@ impl Default for PlotState {
             y_axis_link: None,
             x_link_version: 0,
             y_link_version: 0,
+            x_axis_link_offset: 0.0,
+            x_axis_link_offset_version: 0,
             camera: Camera::new(1000, 600),
             bounds: Rectangle::default(),
             grid_style: GridStyle::default(),
@@ -376,6 +380,8 @@ impl PlotState {
         self.y_axis_scale = widget.y_axis_scale;
         self.x_axis_link = widget.x_axis_link.clone();
         self.y_axis_link = widget.y_axis_link.clone();
+        self.x_axis_link_offset = widget.x_axis_link_offset;
+        self.x_axis_link_offset_version = widget.x_axis_link_offset_version;
 
         // highlighted_points
         self.sync_highlighted_points_from_widget(widget);
@@ -908,7 +914,10 @@ impl PlotState {
 
     fn update_axis_links(&mut self) {
         if let Some(ref link) = self.x_axis_link {
-            link.set(self.camera.position.x, self.camera.half_extents.x);
+            link.set(
+                self.camera.position.x + self.x_axis_link_offset,
+                self.camera.half_extents.x,
+            );
             self.x_link_version = link.version();
         }
         if let Some(ref link) = self.y_axis_link {
