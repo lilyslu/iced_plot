@@ -1444,6 +1444,7 @@ fn build_view_change(
     prev_bounds: Rectangle,
     camera: Camera,
     bounds: Rectangle,
+    x_axis_link_offset_changed: bool,
 ) -> Option<PlotViewChange> {
     let x_zoomed = value_changed(camera.half_extents.x, prev_camera.half_extents.x);
     let y_zoomed = value_changed(camera.half_extents.y, prev_camera.half_extents.y);
@@ -1458,6 +1459,7 @@ fn build_view_change(
         y_zoomed,
         panned,
         resized,
+        x_axis_link_offset_changed,
     })
 }
 
@@ -1686,10 +1688,12 @@ fn update_plot_program<const IS_CANVAS: bool>(
     let limits_changed = widget.x_lim != state.x_lim || widget.y_lim != state.y_lim;
     let instance_switched = state.source_instance_id != Some(widget.instance_id);
     let first_time_widget_view = instance_switched && widget.camera_bounds.is_none();
-    let x_axis_link_offset_changed = instance_switched
-        || widget.x_axis_link_offset_version != state.x_axis_link_offset_version
-        || widget.x_axis_link_offset.to_bits() != state.x_axis_link_offset.to_bits();
-    if x_axis_link_offset_changed {
+    let x_axis_link_offset_changed = widget.x_axis_link_offset.to_bits()
+        != state.x_axis_link_offset.to_bits()
+        || (!instance_switched
+            && widget.x_axis_link_offset_version != state.x_axis_link_offset_version);
+    let x_axis_link_offset_sync_needed = instance_switched || x_axis_link_offset_changed;
+    if x_axis_link_offset_sync_needed {
         state.x_axis_link_offset = widget.x_axis_link_offset;
         state.x_axis_link_offset_version = widget.x_axis_link_offset_version;
         effects.needs_redraw = true;
@@ -1747,7 +1751,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
     // Check if axis links have been updated by other plots.
     if let Some(ref link) = state.x_axis_link {
         let link_version = link.version();
-        if link_version != state.x_link_version || x_axis_link_offset_changed {
+        if link_version != state.x_link_version || x_axis_link_offset_sync_needed {
             let (position, half_extent, version) = link.get();
             if version == 0 {
                 link.set(
@@ -1847,7 +1851,13 @@ fn update_plot_program<const IS_CANVAS: bool>(
         invalidation.all();
     }
 
-    let view_change = build_view_change(prev_camera, prev_bounds, state.camera, state.bounds);
+    let view_change = build_view_change(
+        prev_camera,
+        prev_bounds,
+        state.camera,
+        state.bounds,
+        x_axis_link_offset_changed,
+    );
     if view_change.is_some() {
         effects.publish_camera_bounds = true;
     }
@@ -2235,6 +2245,7 @@ mod tests {
             bounds(640.0, 480.0),
             camera([1.0, 0.0], [10.0, 5.0]),
             bounds(640.0, 480.0),
+            false,
         )
         .unwrap();
 
@@ -2242,6 +2253,22 @@ mod tests {
         assert!(!change.x_zoomed);
         assert!(!change.y_zoomed);
         assert!(!change.resized);
+        assert!(!change.x_axis_link_offset_changed);
+    }
+
+    #[test]
+    fn build_view_change_reports_x_axis_link_offset_change() {
+        let change = build_view_change(
+            camera([0.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+            camera([-3_600_000_000.0, 0.0], [10.0, 5.0]),
+            bounds(640.0, 480.0),
+            true,
+        )
+        .unwrap();
+
+        assert!(change.panned);
+        assert!(change.x_axis_link_offset_changed);
     }
 
     #[test]
@@ -2251,6 +2278,7 @@ mod tests {
             bounds(640.0, 480.0),
             camera([0.0, 0.0], [8.0, 5.0]),
             bounds(640.0, 480.0),
+            false,
         )
         .unwrap();
 
@@ -2268,6 +2296,7 @@ mod tests {
             bounds(640.0, 480.0),
             camera([0.0, 0.0], [10.0, 5.0]),
             bounds(800.0, 480.0),
+            false,
         )
         .unwrap();
 
@@ -2285,6 +2314,7 @@ mod tests {
             bounds(640.0, 480.0),
             camera([0.0, 0.0], [10.0, 5.0]),
             bounds(640.0, 480.0),
+            true,
         );
 
         assert_eq!(change, None);

@@ -134,6 +134,13 @@ pub struct PlotViewChange {
     pub y_zoomed: bool,
     pub panned: bool,
     pub resized: bool,
+    /// Whether this view update coincided with a changed per-plot x-axis link offset.
+    ///
+    /// This identifies the programmatic camera movement caused by
+    /// [`crate::PlotWidget::set_x_axis_link_offset`]. It can be true alongside
+    /// the geometric classifications above when changes are coalesced into one
+    /// render update.
+    pub x_axis_link_offset_changed: bool,
 }
 
 impl PlotViewBounds {
@@ -262,11 +269,18 @@ mod tests {
             y_zoomed: false,
             panned: true,
             resized: false,
+            x_axis_link_offset_changed: true,
         };
         let message =
             PlotUiMessage::RenderUpdate(render_update_with_view_change(Some(view_change)));
 
         assert_eq!(message.get_view_change(), Some(view_change));
+        assert!(
+            message
+                .get_view_change()
+                .unwrap()
+                .x_axis_link_offset_changed
+        );
     }
 
     #[test]
